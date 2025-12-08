@@ -17,11 +17,11 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install project
+      - name: Install Python deps
         run: |
           set -euxo pipefail
           python -m pip install --upgrade pip
-          python -m pip install .
+          python -m pip install pytest pydantic
 
       - name: Run tests
         env:
