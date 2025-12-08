@@ -1,5 +1,6 @@
 import json
 import re
+import hashlib
 from pathlib import Path
 import zipfile
 
@@ -94,6 +95,24 @@ def test_seal_and_verify_happy_path(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     assert bundle_path.is_file()
     assert bundle_path.name.startswith("oord_bundle_")
     assert bundle_path.suffix == ".zip"
+
+    # Layout: root files + payload layout, no legacy artifacts
+    with zipfile.ZipFile(bundle_path, "r") as z:
+        names = set(z.namelist())
+
+        # Root control files
+        assert "manifest.json" in names
+        assert "jwks_snapshot.json" in names
+        assert "tl_proof.json" in names
+
+        # Payload layout
+        assert "files/a.txt" in names
+        assert "files/sub/b.txt" in names
+
+        # No pre-pivot artifacts
+        assert "receipt.txt" not in names
+        assert "proof.json" not in names
+        assert "inspector_pack/manifest.json" not in names
 
     # Run: oord verify
     with pytest.raises(SystemExit) as ei_verify:
@@ -193,3 +212,75 @@ def test_verify_detects_hash_mismatch(tmp_path: Path, monkeypatch: pytest.Monkey
     assert ok is False
     assert summary["hashes_ok"] is False
     assert summary["hash_mismatches"]
+
+
+def test_build_bundle_is_deterministic(tmp_path: Path) -> None:
+    """
+    Given the same manifest/tl_proof/jwks and input_dir, _build_bundle should
+    produce byte-identical ZIPs across runs.
+    """
+    input_dir = _make_files(tmp_path)
+    out1 = tmp_path / "out1"
+    out2 = tmp_path / "out2"
+
+    files = oord_cli._collect_files_for_manifest(input_dir)
+
+    manifest = {
+        "manifest_version": "1.0",
+        "org_id": "TEST-ORG",
+        "batch_id": "BATCH-1",
+        "created_at_ms": 0,
+        "key_id": "stub-kid",
+        "hash_alg": "sha256",
+        "merkle": {
+            "root_cid": "cid:sha256:" + "a" * 64,
+            "tree_alg": "binary_merkle_sha256",
+        },
+        "files": files,
+        "signature": "stub-signature",
+    }
+    tl_proof = {
+        "tl_seq": 1,
+        "merkle_root": manifest["merkle"]["root_cid"],
+        "sth_sig": "stub-sth-sig",
+        "signer_key_id": "stub-kid",
+    }
+    jwks = {
+        "keys": [
+            {
+                "kid": "stub-kid",
+                "kty": "OKP",
+                "crv": "Ed25519",
+                "alg": "EdDSA",
+                "use": "sig",
+                "x": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            }
+        ]
+    }
+
+    bundle1 = oord_cli._build_bundle(manifest, tl_proof, jwks, input_dir, out1)
+    bundle2 = oord_cli._build_bundle(manifest, tl_proof, jwks, input_dir, out2)
+
+    assert bundle1.is_file()
+    assert bundle2.is_file()
+
+    data1 = bundle1.read_bytes()
+    data2 = bundle2.read_bytes()
+
+    # Full byte equality
+    assert data1 == data2
+
+    # And the hash is stable as a sanity check
+    h1 = hashlib.sha256(data1).hexdigest()
+    h2 = hashlib.sha256(data2).hexdigest()
+    assert h1 == h2
+
+    # Layout inside the deterministic bundle is also as expected
+    with zipfile.ZipFile(bundle1, "r") as z:
+        names = set(z.namelist())
+        assert "manifest.json" in names
+        assert "jwks_snapshot.json" in names
+        assert "tl_proof.json" in names
+        assert "files/a.txt" in names
+        assert "files/sub/b.txt" in names
+

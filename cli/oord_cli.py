@@ -181,7 +181,7 @@ def _build_bundle(
     out_dir: Path,
 ) -> Path:
     """
-    Build an Oord bundle ZIP:
+    Build an Oord bundle ZIP (deterministic):
       - manifest.json
       - tl_proof.json (if present)
       - jwks_snapshot.json
@@ -217,14 +217,22 @@ def _build_bundle(
         data = disk_path.read_bytes()
         files_to_write.append((internal, data))
 
-    bundle_id = _compute_bundle_id(files_to_write)
+    # Deterministic ordering of all entries by archive name
+    files_to_write_sorted = sorted(files_to_write, key=lambda x: x[0])
+
+    # Bundle id is derived from the sorted entries
+    bundle_id = _compute_bundle_id(files_to_write_sorted)
     out_dir.mkdir(parents=True, exist_ok=True)
     bundle_path = out_dir / f"oord_bundle_{bundle_id}.zip"
     tmp_path = bundle_path.with_suffix(".zip.tmp")
 
     with zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
-        for name, data in files_to_write:
-            z.writestr(name, data)
+        for name, data in files_to_write_sorted:
+            info = zipfile.ZipInfo(filename=name)
+            # Fixed timestamp for deterministic zips
+            info.date_time = (1980, 1, 1, 0, 0, 0)
+            info.compress_type = zipfile.ZIP_DEFLATED
+            z.writestr(info, data)
 
     tmp_path.replace(bundle_path)
     return bundle_path
