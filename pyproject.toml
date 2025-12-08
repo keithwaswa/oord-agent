@@ -8,4 +8,4 @@ dependencies = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-norecursedirs = [".git", ".venv", "_out", "gateway/_out", "build", "dist"]
+norecursedirs = [".git", ".venv", "_out", "build", "dist"]

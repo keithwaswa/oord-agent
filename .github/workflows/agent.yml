@@ -17,22 +17,13 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-
       - name: Install Python deps
         run: |
           set -euxo pipefail
           python -m pip install --upgrade pip
           python -m pip install pytest
 
-      - name: Build
+      - name: Run tests
         run: |
           set -euxo pipefail
-          cargo build --manifest-path gateway/Cargo.toml
-
-      - name: Test
-        run: |
-          set -euxo pipefail
-          cargo test --manifest-path gateway/Cargo.toml
-          pytest
+          PYTHONPATH=. pytest
