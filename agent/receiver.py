@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -15,13 +16,27 @@ from typing import Dict, List, Tuple
 
 from .config import AgentConfig
 
-def _log(msg: str) -> None:
-    """
-    Minimal human-readable logging for receiver events.
-    """
-    ts = datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z"
-    print(f"[receiver] {ts} {msg}")
 
+logger = logging.getLogger("agent.receiver")
+
+
+def _log(level: str, event: str, **fields: object) -> None:
+    """
+    Structured-ish logging helper for receiver events.
+    Emits lines like:
+      [receiver] 2025-... level=INFO event=verify_pass bundle=...
+    """
+    ts = datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds") + "Z"
+    parts = [f"event={event}"]
+    for k, v in fields.items():
+        parts.append(f"{k}={v}")
+    msg = f"[receiver] {ts} level={level.upper()} " + " ".join(parts)
+    if level.lower() == "error":
+        logger.error(msg)
+    elif level.lower() == "warning":
+        logger.warning(msg)
+    else:
+        logger.info(msg)
 
 @dataclass
 class ReceiverState:
@@ -98,6 +113,8 @@ def verify_bundle_via_cli(cfg: AgentConfig, bundle_path: Path) -> Tuple[int, str
 
     Returns: (exit_code, stdout, stderr)
     """
+    _log("info", "verify_start", bundle=str(bundle_path))
+
     cmd = [
         sys.executable,
         "-m",
@@ -139,7 +156,16 @@ def run_receiver_loop(cfg: AgentConfig, once: bool = False) -> None:
     quarantine_dir = cfg.receiver_paths.quarantine_dir
     state_path = cfg.receiver_paths.state_file
 
-    _log(f"starting receiver loop incoming_dir={incoming_dir} verified_root={verified_root} quarantine_dir={quarantine_dir} state_file={state_path}")
+    _log(
+        "info",
+        "agent_start",
+        incoming_dir=str(incoming_dir),
+        verified_root=str(verified_root),
+        quarantine_dir=str(quarantine_dir),
+        state_file=str(state_path),
+        poll_interval_sec=cfg.agent.poll_interval_sec,
+        settle_seconds=cfg.agent.settle_seconds,
+    )
 
     state = load_state(state_path)
 
@@ -153,10 +179,15 @@ def run_receiver_loop(cfg: AgentConfig, once: bool = False) -> None:
         )
 
         if ready:
-            _log(f"found {len(ready)} ready bundle(s)")
+            _log(
+                "info",
+                "bundles_ready",
+                count=len(ready),
+                incoming_dir=str(incoming_dir),
+            )
+
 
         for bundle_path in ready:
-            _log(f"verifying bundle name={bundle_path.name} path={bundle_path}")
             code, stdout, stderr = verify_bundle_via_cli(cfg, bundle_path)
             if stdout:
                 # passthrough CLI stdout
@@ -170,7 +201,12 @@ def run_receiver_loop(cfg: AgentConfig, once: bool = False) -> None:
             if code == 0:
                 # verified; extract files and record state
                 _extract_verified_files(bundle_path, verified_root)
-                _log(f"bundle verified ok name={name} extracted_to={verified_root / bundle_path.stem}")
+                _log(
+                    "info",
+                    "verify_pass",
+                    bundle=name,
+                    extracted_to=str(verified_root / bundle_path.stem),
+                )
                 state.processed_bundles[name] = "verified"
                 save_state(state_path, state)
             elif code == 1:
@@ -178,17 +214,31 @@ def run_receiver_loop(cfg: AgentConfig, once: bool = False) -> None:
                 quarantine_dir.mkdir(parents=True, exist_ok=True)
                 target = quarantine_dir / name
                 os.replace(bundle_path, target)
-                _log(f"bundle verification failed name={name} moved_to_quarantine={target}")
+                _log(
+                    "warning",
+                    "verify_fail",
+                    bundle=name,
+                    moved_to_quarantine=str(target),
+                    exit_code=code,
+                )
                 state.processed_bundles[name] = "quarantined"
                 save_state(state_path, state)
             else:
                 # env/usage error (exit code 2 etc.) – leave bundle in place, do not mark state
-                _log(f"verify returned env/usage error for bundle name={name} exit_code={code}; leaving in place for retry")
+                _log(
+                    "error",
+                    "verify_env_error",
+                    bundle=name,
+                    exit_code=code,
+                )
                 continue
 
         if once:
             # Dev/one-shot mode: process whatever was ready and exit.
+            _log("info", "agent_exit", reason="once_mode")
             break
 
         time.sleep(cfg.agent.poll_interval_sec)
+
+    _log("info", "agent_exit", reason="loop_ended")
 

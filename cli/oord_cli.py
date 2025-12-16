@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import hashlib
+import datetime
 import json
 import os
 import sys
@@ -28,6 +29,15 @@ from agent.receiver import run_receiver_loop
 def _sha256_bytes(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
 
+def _home_dir() -> Path:
+    return Path(os.environ.get("HOME", str(Path.home()))).expanduser().resolve()
+
+def _oord_home() -> Path:
+    # Future-proof: allow override via OORD_HOME, default ~/.oord
+    root = os.environ.get("OORD_HOME")
+    if root:
+        return Path(root).expanduser().resolve()
+    return _home_dir() / ".oord"
 
 def _canonical_json_bytes(obj: Any) -> bytes:
     return json.dumps(
@@ -36,6 +46,84 @@ def _canonical_json_bytes(obj: Any) -> bytes:
         separators=(",", ":"),
         ensure_ascii=False,
     ).encode("utf-8")
+
+def _short_hex(s: Optional[str], n: int = 12) -> str:
+    if not s:
+        return "-"
+    return s[:n]
+
+def _safe_int(v: Any) -> Optional[int]:
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, int):
+        return v
+    if isinstance(v, float):
+        return int(v)
+    if isinstance(v, str) and v.isdigit():
+        return int(v)
+    return None
+
+def _manifest_meta(manifest: Dict[str, Any]) -> Dict[str, Any]:
+    org_id = manifest.get("org_id") if isinstance(manifest.get("org_id"), str) else None
+    batch_id = manifest.get("batch_id") if isinstance(manifest.get("batch_id"), str) else None
+    created_at_ms = _safe_int(manifest.get("created_at_ms"))
+    key_id = manifest.get("key_id") if isinstance(manifest.get("key_id"), str) else None
+    merkle_root = None
+    merkle = manifest.get("merkle")
+    if isinstance(merkle, dict) and isinstance(merkle.get("root_cid"), str):
+        merkle_root = merkle.get("root_cid")
+
+    files = manifest.get("files")
+    file_count = 0
+    total_bytes = 0
+    if isinstance(files, list):
+        for fe in files:
+            if not isinstance(fe, dict):
+                continue
+            file_count += 1
+            sb = _safe_int(fe.get("size_bytes"))
+            if sb is not None and sb >= 0:
+                total_bytes += sb
+
+    return {
+        "org_id": org_id,
+        "batch_id": batch_id,
+        "created_at_ms": created_at_ms,
+        "key_id": key_id,
+        "merkle_root": merkle_root,
+        "file_count": file_count,
+        "total_bytes": total_bytes,
+    }
+
+def _build_receipt_txt(
+    manifest: Dict[str, Any],
+    tl_proof: Optional[Dict[str, Any]],
+    jwks: Dict[str, Any],
+) -> str:
+    m = _manifest_meta(manifest)
+    jwks_fp = _jwks_fingerprint(jwks)
+    tl_root, tl_seq, tl_sth, tl_kid = (None, None, None, None)
+    tl_status = "missing"
+    if tl_proof is not None:
+        tl_root, tl_seq, tl_sth, tl_kid = _normalize_tl_fields(tl_proof)
+        tl_status = "present"
+    lines: List[str] = []
+    lines.append("OORD RECEIPT v1")
+    lines.append(f"org_id: {m.get('org_id') or '-'}")
+    lines.append(f"batch_id: {m.get('batch_id') or '-'}")
+    lines.append(f"created_at_ms: {m.get('created_at_ms') if m.get('created_at_ms') is not None else '-'}")
+    lines.append(f"file_count: {m.get('file_count')}")
+    lines.append(f"total_bytes: {m.get('total_bytes')}")
+    lines.append(f"merkle_root: {m.get('merkle_root') or '-'}")
+    lines.append(f"manifest_key_id: {m.get('key_id') or '-'}")
+    lines.append(f"jwks_fp_sha256: {jwks_fp}")
+    lines.append(f"tl_status: {tl_status}")
+    lines.append(f"tl_seq: {tl_seq if tl_seq is not None else '-'}")
+    lines.append(f"tl_merkle_root: {tl_root or '-'}")
+    lines.append(f"tl_signer_kid: {tl_kid or '-'}")
+    lines.append(f"tl_sth_sig: {tl_sth or '-'}")
+    return "\n".join(lines) + "\n"
+
 
 def _compute_merkle_root_from_manifest_files(files: List[Dict[str, Any]]) -> str:
     """
@@ -217,6 +305,70 @@ def _fetch_jwks_snapshot(base_url: str, api_key: Optional[str]) -> Dict[str, Any
         raise RuntimeError("JWKS from Core must contain at least one key")
     return obj
 
+def _write_text_if_absent(path: Path, content: str, force: bool) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists() and not force:
+        return
+    path.write_text(content, encoding="utf-8")
+
+def _write_json_if_absent(path: Path, obj: Dict[str, Any], force: bool) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists() and not force:
+        return
+    path.write_text(
+        json.dumps(obj, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
+def _sender_template(core_url: str, org_id: str) -> str:
+    return f"""mode = "sender"
+
+[core]
+base_url = "{core_url}"
+
+[org]
+id = "{org_id}"
+# batch_prefix = "DEMO"
+
+[agent]
+poll_interval_sec = 1
+settle_seconds = 2
+recursive = true
+
+[logging]
+level = "INFO"
+# file = "~/.oord/logs/sender.log"
+
+[sender.paths]
+watch_dir = "~/.oord/watch/exports"
+out_dir = "~/.oord/out/ready_to_send"
+state_file = "~/.oord/state/sender_state.json"
+"""
+
+def _receiver_template(core_url: str, org_id: str) -> str:
+    return f"""mode = "receiver"
+
+[core]
+base_url = "{core_url}"
+
+[org]
+id = "{org_id}"
+
+[agent]
+poll_interval_sec = 1
+settle_seconds = 2
+recursive = true
+
+[logging]
+level = "INFO"
+# file = "~/.oord/logs/receiver.log"
+
+[receiver.paths]
+incoming_dir = "~/.oord/incoming"
+verified_root = "~/.oord/verified"
+quarantine_dir = "~/.oord/quarantine"
+state_file = "~/.oord/state/receiver_state.json"
+"""
 
 def _fetch_tl_entry(
     base_url: str,
@@ -253,6 +405,7 @@ def _build_bundle(
       - manifest.json
       - tl_proof.json (if present)
       - jwks_snapshot.json
+      - receipt.txt
       - files/... (payload files as per manifest.files[].path)
     """
     files_to_write: List[Tuple[str, bytes]] = []
@@ -267,6 +420,9 @@ def _build_bundle(
 
     jwks_bytes = _canonical_json_bytes(jwks)
     files_to_write.append(("jwks_snapshot.json", jwks_bytes))
+
+    receipt_txt = _build_receipt_txt(manifest, tl_proof, jwks)
+    files_to_write.append(("receipt.txt", receipt_txt.encode("utf-8")))
 
     # Payload files as defined in manifest.files
     for fe in manifest.get("files", []):
@@ -358,6 +514,62 @@ def _cmd_seal(args: argparse.Namespace) -> int:
     print(str(bundle_path))
     return 0
 
+def _cmd_setup(args: argparse.Namespace) -> int:
+    core_url = (
+        args.core_url
+        or os.environ.get("OORD_CORE_URL")
+        or "http://127.0.0.1:8000"
+    )
+    api_key = args.api_key or os.environ.get("OORD_CORE_API_KEY")
+    org_id = args.org_id or "ORG-LOCAL"
+
+    oord_home = _oord_home()
+    cfg_dir = oord_home / "config"
+    logs_dir = oord_home / "logs"
+    state_dir = oord_home / "state"
+    watch_exports = oord_home / "watch" / "exports"
+    out_ready = oord_home / "out" / "ready_to_send"
+    incoming = oord_home / "incoming"
+    verified = oord_home / "verified"
+    quarantine = oord_home / "quarantine"
+
+    for d in [
+        cfg_dir,
+        logs_dir,
+        state_dir,
+        watch_exports,
+        out_ready,
+        incoming,
+        verified,
+        quarantine,
+    ]:
+        d.mkdir(parents=True, exist_ok=True)
+
+    try:
+        jwks = _fetch_jwks_snapshot(core_url, api_key)
+    except (urlerror.URLError, TimeoutError) as e:
+        print(f"❌ Core unreachable (JWKS fetch failed): {e}", file=sys.stderr)
+        return 2
+    except Exception as e:
+        print(f"❌ setup failed fetching JWKS: {e}", file=sys.stderr)
+        return 2
+
+    jwks_path = oord_home / "jwks_cache.json"
+    _write_json_if_absent(jwks_path, jwks, force=bool(args.force))
+
+    sender_cfg = cfg_dir / "sender.toml"
+    receiver_cfg = cfg_dir / "receiver.toml"
+    _write_text_if_absent(sender_cfg, _sender_template(core_url, org_id), force=bool(args.force))
+    _write_text_if_absent(receiver_cfg, _receiver_template(core_url, org_id), force=bool(args.force))
+
+    fp = _jwks_fingerprint(jwks)
+    print("✅ Oord setup complete")
+    print(f"  OORD_HOME: {oord_home}")
+    print(f"  Core URL:  {core_url}")
+    print(f"  JWKS fp:   {fp}")
+    print(f"  Sender:    {sender_cfg}")
+    print(f"  Receiver:  {receiver_cfg}")
+    return 0
 
 # ---------------------------
 # Verification (oord verify)
@@ -691,6 +903,14 @@ def verify_bundle(path: Path, tl_url: Optional[str] = None) -> Tuple[bool, Dict[
         "bundle_path": str(path),
         "error": None,
         "error_kind": None,  # "env" for usage/env errors
+        "batch": {
+            "org_id": None,
+            "batch_id": None,
+            "created_at_ms": None,
+            "file_count": None,
+            "total_bytes": None,
+            "merkle_root": None,
+        },
         "hashes_ok": False,
         "hash_mismatches": [],
         "tl": {
@@ -738,6 +958,7 @@ def verify_bundle(path: Path, tl_url: Optional[str] = None) -> Tuple[bool, Dict[
     try:
         with zipfile.ZipFile(path, "r") as z:
             manifest = _load_manifest(z)
+            summary["batch"].update(_manifest_meta(manifest))
             hashes_ok, mismatches = _check_hashes_from_manifest(z, manifest)
             summary["hashes_ok"] = hashes_ok
             summary["hash_mismatches"] = mismatches
@@ -932,88 +1153,147 @@ def verify_bundle(path: Path, tl_url: Optional[str] = None) -> Tuple[bool, Dict[
 
     return True, summary
 
+def _first_failure_kind(summary: Dict[str, Any]) -> str:
+    if summary.get("hashes_ok") is False:
+        return "hashes"
+    merkle = summary.get("merkle", {})
+    if isinstance(merkle, dict) and merkle.get("ok") is False:
+        return "merkle"
+    jwks = summary.get("jwks", {})
+    if isinstance(jwks, dict) and jwks.get("ok") is False:
+        return "jwks"
+    ms = summary.get("manifest_sig", {})
+    if isinstance(ms, dict) and ms.get("ok") is False:
+        return "manifest_sig"
+    tl = summary.get("tl", {})
+    if isinstance(tl, dict) and tl.get("present") and tl.get("ok") is False:
+        return "tl"
+    tlo = summary.get("tl_online", {})
+    if isinstance(tlo, dict) and tlo.get("enabled") and tlo.get("ok") is False:
+        return "tl_online"
+    return "unknown"
 
-def _print_human(summary: Dict[str, Any], ok: bool) -> None:
-    print(f"Bundle: {summary['bundle_path']}")
+def _print_human(summary: Dict[str, Any], ok: bool, verbose: bool) -> None:
+    b = summary.get("batch", {}) if isinstance(summary.get("batch"), dict) else {}
+    org_id = b.get("org_id") or "-"
+    batch_id = b.get("batch_id") or "-"
+    root = b.get("merkle_root") or summary.get("merkle", {}).get("manifest_root") or "-"
+    file_count = b.get("file_count")
+    total_bytes = b.get("total_bytes")
 
-    print(f"Hashes: {'OK' if summary['hashes_ok'] else 'FAIL'}")
-    if not summary["hashes_ok"]:
+    tl = summary.get("tl", {}) if isinstance(summary.get("tl"), dict) else {}
+    tl_part = "tl=missing"
+    if tl.get("present"):
+        tl_part = f"tl=seq:{tl.get('seq')}"
+
+    if ok:
+        print(
+            f"PASS org={org_id} batch={batch_id} root={root} files={file_count if file_count is not None else '-'} bytes={total_bytes if total_bytes is not None else '-'} {tl_part}"
+        )
+    else:
+        kind = _first_failure_kind(summary)
+        msg = summary.get("error") or kind
+        print(
+            f"FAIL org={org_id} batch={batch_id} root={root} reason={kind} msg={msg}"
+        )
+
+    if not verbose:
+        return
+
+    print(f"bundle={summary.get('bundle_path')}")
+    print(f"hashes_ok={summary.get('hashes_ok')}")
+    if summary.get("hashes_ok") is False:
         for m in summary.get("hash_mismatches", []):
-            reason = m.get("reason", "mismatch")
-            print(f"  - {reason}: {m}")
+            print(f"  mismatch={m}")
 
     merkle = summary.get("merkle", {})
-    if merkle.get("manifest_root") or merkle.get("recomputed_root"):
+    if isinstance(merkle, dict):
         print(
-            f"Merkle: {'OK' if merkle.get('ok') else 'FAIL'} "
-            f"(manifest={merkle.get('manifest_root') or '-'}, "
-            f"recomputed={merkle.get('recomputed_root') or '-'})"
+            f"merkle_ok={merkle.get('ok')} manifest_root={merkle.get('manifest_root') or '-'} recomputed_root={merkle.get('recomputed_root') or '-'}"
         )
-        if not merkle.get("ok") and merkle.get("error"):
-            print(f"  Merkle error: {merkle['error']}")
-
-    tl = summary.get("tl", {})
-    if tl.get("present"):
-        print(
-            f"TL: {'OK' if tl.get('ok') else 'FAIL'} "
-            f"(seq={tl.get('seq')}, root={tl.get('merkle_root')}, "
-            f"kid={tl.get('signer_kid') or '-'}, "
-            f"sth_sig={tl.get('sth_sig') or '-'}, "
-            f"sig_verified={tl.get('sig_verified')})"
-        )
-        if not tl.get("ok") and tl.get("error"):
-            print(f"  TL error: {tl['error']}")
-    else:
-        print("TL: MISSING")
+        if merkle.get("error"):
+            print(f"  merkle_error={merkle.get('error')}")
 
     jwks = summary.get("jwks", {})
-    if jwks.get("present"):
+    if isinstance(jwks, dict):
+        kids = jwks.get("kids") or []
+        if isinstance(kids, list):
+            kids_s = ",".join(str(x) for x in kids if x)
+        else:
+            kids_s = "-"
         print(
-            f"JWKS: {'OK' if jwks.get('ok') else 'FAIL'} "
-            f"(kids={','.join(jwks.get('kids') or []) or '-'}, "
-            f"fp={jwks.get('fingerprint') or '-'})"
+            f"jwks_ok={jwks.get('ok')} kids={kids_s or '-'} fp={_short_hex(jwks.get('fingerprint'))}"
         )
-        if not jwks.get("ok") and jwks.get("error"):
-            print(f"  JWKS error: {jwks['error']}")
-    else:
-        print("JWKS: MISSING")
+        if jwks.get("error"):
+            print(f"  jwks_error={jwks.get('error')}")
 
-    tl_online = summary.get("tl_online", {})
-    if tl_online.get("enabled"):
-        print(f"TL (online): {'OK' if tl_online.get('ok') else 'FAIL'}")
-        if tl_online.get("error"):
-            print(f"  TL online error: {tl_online['error']}")
-    else:
-        print("TL (online): SKIPPED")
+    ms = summary.get("manifest_sig", {})
+    if isinstance(ms, dict):
+        print(
+            f"manifest_sig_ok={ms.get('ok')} key_id={ms.get('key_id') or '-'} sig_verified={ms.get('sig_verified')}"
+        )
+        if ms.get("error"):
+            print(f"  manifest_sig_error={ms.get('error')}")
 
-    print("OK" if ok else "FAIL")
+    if isinstance(tl, dict):
+        if tl.get("present"):
+            print(
+                f"tl_ok={tl.get('ok')} seq={tl.get('seq')} sig_verified={tl.get('sig_verified')} signer_kid={tl.get('signer_kid') or '-'}"
+            )
+            if tl.get("error"):
+                print(f"  tl_error={tl.get('error')}")
+        else:
+            print("tl_present=false")
+
+    tlo = summary.get("tl_online", {})
+    if isinstance(tlo, dict):
+        print(
+            f"tl_online_enabled={tlo.get('enabled')} ok={tlo.get('ok')}"
+        )
+        if tlo.get("error"):
+            print(f"  tl_online_error={tlo.get('error')}")
 
 
 def _cmd_verify(args: argparse.Namespace) -> int:
-    path = Path(args.bundle).expanduser().resolve()
-    ok, summary = verify_bundle(path, tl_url=args.tl_url)
+    bundle_paths = [Path(p).expanduser().resolve() for p in args.bundles]
+    results: List[Tuple[bool, Dict[str, Any]]] = []
+    for path in bundle_paths:
+        ok, summary = verify_bundle(path, tl_url=args.tl_url)
 
-    # strict TL unreachable handling
-    if (
-        args.strict
-        and summary.get("tl_online", {}).get("enabled")
-        and summary.get("tl_online", {}).get("ok") is False
-    ):
-        err = summary.get("tl_online", {}).get("error") or ""
-        if err.startswith("TL online lookup failed:"):
-            summary["error_kind"] = "env"
-            if not summary.get("error"):
-                summary["error"] = err
-            ok = False
+        if (
+            args.strict
+            and summary.get("tl_online", {}).get("enabled")
+            and summary.get("tl_online", {}).get("ok") is False
+        ):
+            err = summary.get("tl_online", {}).get("error") or ""
+            if err.startswith("TL online lookup failed:"):
+                summary["error_kind"] = "env"
+                if not summary.get("error"):
+                    summary["error"] = err
+                ok = False
+
+        results.append((ok, summary))
+
 
     if args.json:
-        print(json.dumps(summary, indent=2, sort_keys=True))
+        payload: Any
+        if len(results) == 1:
+            payload = results[0][1]
+        else:
+            payload = [s for _, s in results]
+        print(json.dumps(payload, indent=2, sort_keys=True))
     else:
-        _print_human(summary, ok)
+        for i, (ok_i, summary_i) in enumerate(results):
+            if i:
+                print()
+            _print_human(summary_i, ok_i, verbose=bool(args.verbose))
 
-    if ok:
+    any_fail = any(not ok_i for ok_i, _ in results)
+    if not any_fail:
         return 0
-    return 2 if summary.get("error_kind") == "env" else 1
+    any_env = any((s.get("error_kind") == "env") for ok_i, s in results if not ok_i)
+    return 2 if any_env else 1
+
 
 
 def main(argv: Optional[List[str]] = None) -> None:
@@ -1022,6 +1302,27 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     parser = argparse.ArgumentParser(prog="oord", description="Oord CLI (seal / verify)")
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+        # oord setup
+    p_setup = subparsers.add_parser("setup", help="Initialize ~/.oord scaffolding + configs + JWKS cache")
+    p_setup.add_argument(
+        "--core-url",
+        help="Core base URL (default: $OORD_CORE_URL or http://127.0.0.1:8000)",
+    )
+    p_setup.add_argument(
+        "--api-key",
+        help="Core API key for Authorization: Bearer <key> (default: $OORD_CORE_API_KEY)",
+    )
+    p_setup.add_argument(
+        "--org-id",
+        help="Org id to embed in generated configs (default: ORG-LOCAL)",
+    )
+    p_setup.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite existing ~/.oord files (configs, jwks cache)",
+    )
+    p_setup.set_defaults(func=_cmd_setup)
 
     # oord seal
     p_seal = subparsers.add_parser("seal", help="Seal a folder into an Oord bundle")
@@ -1054,8 +1355,8 @@ def main(argv: Optional[List[str]] = None) -> None:
     p_seal.set_defaults(func=_cmd_seal)
 
     # oord verify
-    p_verify = subparsers.add_parser("verify", help="Verify an Oord bundle")
-    p_verify.add_argument("bundle", help="Path to oord_bundle_*.zip")
+    p_verify = subparsers.add_parser("verify", help="Verify one or more Oord bundles")
+    p_verify.add_argument("bundles", nargs="+", help="Path(s) to oord_bundle_*.zip")
     p_verify.add_argument(
         "--tl-url",
         help="Optional Core base URL for online TL verification (e.g. http://127.0.0.1:8000)",
@@ -1070,9 +1371,14 @@ def main(argv: Optional[List[str]] = None) -> None:
         action="store_true",
         help="Treat TL unreachable as an error (exit code 2) instead of a soft warning",
     )
+    p_verify.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print detailed component results (hash mismatches, merkle, jwks, sig checks)",
+    )
     p_verify.set_defaults(func=_cmd_verify)
 
-        # oord agent
+    # oord agent
     p_agent = subparsers.add_parser(
         "agent",
         help="Run the Oord agent (sender or receiver) from a config file",
@@ -1107,6 +1413,14 @@ def main(argv: Optional[List[str]] = None) -> None:
     code = args.func(args)
     sys.exit(code)
 
+def agent_main(argv: Optional[List[str]] = None) -> None:
+    """
+    Console script entrypoint for `oord-agent`.
+    We intentionally route through the `oord agent` subcommand so the agent and CLI stay one coherent surface.
+    """
+    if argv is None:
+        argv = sys.argv[1:]
+    main(["agent", *argv])
 
 if __name__ == "__main__":
     main()

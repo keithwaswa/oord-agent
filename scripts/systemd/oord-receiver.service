@@ -1,0 +1,19 @@
+[Unit]
+Description=Oord Agent Receiver
+After=network.target
+
+[Service]
+Type=simple
+User=oord
+Group=oord
+WorkingDirectory=/opt/oord-agent
+Environment="PYTHONPATH=/opt/oord-agent"
+ExecStart=/usr/bin/python -m agent receiver --config /etc/oord/receiver.toml
+Restart=on-failure
+RestartSec=5
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

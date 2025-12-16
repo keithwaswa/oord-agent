@@ -1,0 +1,10 @@
+Metadata-Version: 2.4
+Name: oord-agent
+Version: 0.1.0
+Summary: Oord courier agent + CLI (seal/verify + sender/receiver watcher).
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: pydantic<3,>=2
+Requires-Dist: cryptography>=42
+Provides-Extra: dev
+Requires-Dist: pytest; extra == "dev"

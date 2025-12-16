@@ -1,0 +1,3 @@
+[console_scripts]
+oord = cli.oord_cli:main
+oord-agent = cli.oord_cli:agent_main

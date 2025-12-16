@@ -1,0 +1,5 @@
+pydantic<3,>=2
+cryptography>=42
+
+[dev]
+pytest

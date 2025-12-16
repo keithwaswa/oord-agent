@@ -16,26 +16,36 @@
   "properties": {
     "manifest_version": {
       "type": "string",
-      "description": "Opaque manifest version string, e.g. '1.0'"
+      "description": "Opaque manifest version string, e.g. '1.0'",
+      "pattern": "^1\\.0$"
     },
-    "org_id": { "type": "string" },
-    "batch_id": { "type": "string" },
-    "created_at_ms": { "type": "integer" },
-    "key_id": { "type": "string" },
+    "org_id": { "type": "string", "minLength": 1 },
+    "batch_id": { "type": "string", "minLength": 1 },
+    "created_at_ms": { "type": "integer", "minimum": 0 },
+    "key_id": { "type": "string", "minLength": 1 },
     "hash_alg": {
       "type": "string",
-      "description": "Hash algorithm used for per-file digests and Merkle leaves"
+      "description": "Hash algorithm used for per-file digests and Merkle leaves",
+      "enum": ["sha256"]
     },
     "merkle": {
       "type": "object",
       "required": ["root_cid", "tree_alg"],
       "properties": {
-        "root_cid": { "type": "string" },
-        "tree_alg": { "type": "string" }
-      }
+        "root_cid": {
+          "type": "string",
+          "pattern": "^cid:sha256:[0-9a-f]{64}$"
+        },
+        "tree_alg": {
+          "type": "string",
+          "enum": ["binary_merkle_sha256"]
+        }
+      },
+      "additionalProperties": false
     },
     "files": {
       "type": "array",
+      "minItems": 1,
       "items": {
         "type": "object",
         "required": ["path", "sha256", "size_bytes"],
@@ -45,14 +55,18 @@
             "description": "Relative path inside the sealed bundle, must start with 'files/' and contain no '..' or '\\\\'",
             "pattern": "^files\\/(?!.*\\.\\.)(?!.*\\\\).+"
           },
-          "sha256": { "type": "string" },
-          "size_bytes": { "type": "integer" }
-        }
+          "sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "size_bytes": { "type": "integer", "minimum": 0 }
+        },
+        "additionalProperties": false
       }
     },
-    "signature": { "type": "string" },
+    "signature": { "type": "string", "minLength": 1 },
     "tl_proof": {
-      "description": "DEPRECATED: TL proof lives in a separate proof.json file; this field is ignored in v1 bundles"
+      "description": "DEPRECATED: TL proof lives in a separate tl_proof.json file; this field is ignored in v1 bundles"
     }
   },
   "additionalProperties": false

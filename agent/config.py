@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -16,6 +16,15 @@ class CoreConfig:
 class OrgConfig:
     id: str
     batch_prefix: Optional[str] = None
+
+@dataclass
+class LoggingConfig:
+    """
+    Optional logging configuration for the agent.
+    """
+
+    level: str = "INFO"
+    file: Optional[Path] = None
 
 
 @dataclass
@@ -46,6 +55,7 @@ class AgentConfig:
     core: CoreConfig
     org: OrgConfig
     agent: AgentSection
+    logging: LoggingConfig = field(default_factory=LoggingConfig)
     sender_paths: Optional[SenderPaths] = None
     receiver_paths: Optional[ReceiverPaths] = None
 
@@ -94,6 +104,14 @@ def _require_bool(d: dict, key: str, default: Optional[bool] = None) -> bool:
         raise ValueError(f"config: {key!r} must be a boolean")
     return v
 
+def _optional_path(d: dict, key: str) -> Optional[Path]:
+    v = d.get(key)
+    if v is None:
+        return None
+    if not isinstance(v, str):
+        raise ValueError(f"config: {key!r} must be a string if set")
+    return Path(v).expanduser()
+
 
 def load_config(path: Path) -> AgentConfig:
     if not path.is_file():
@@ -108,11 +126,17 @@ def load_config(path: Path) -> AgentConfig:
     core_section = _require_section(cfg, "core")
     org_section = _require_section(cfg, "org")
     agent_section = cfg.get("agent") or {}
+    logging_section = cfg.get("logging") or {}
 
     core = CoreConfig(base_url=_require_str(core_section, "base_url"))
     org = OrgConfig(
         id=_require_str(org_section, "id"),
         batch_prefix=_optional_str(org_section, "batch_prefix"),
+    )
+
+    logging_cfg = LoggingConfig(
+        level=_optional_str(logging_section, "level") or "INFO",
+        file=_optional_path(logging_section, "file"),
     )
 
     agent_cfg = AgentSection(
@@ -165,6 +189,7 @@ def load_config(path: Path) -> AgentConfig:
         core=core,
         org=org,
         agent=agent_cfg,
+        logging=logging_cfg,
         sender_paths=sender_paths,
         receiver_paths=receiver_paths,
     )

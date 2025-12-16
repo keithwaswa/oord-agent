@@ -1,8 +1,8 @@
-import json
 import re
 import hashlib
 from pathlib import Path
 import zipfile
+import json
 
 import pytest
 
@@ -113,21 +113,39 @@ def test_seal_and_verify_happy_path(tmp_path: Path, monkeypatch: pytest.MonkeyPa
         assert "files/sub/b.txt" in names
 
         # No pre-pivot artifacts
-        assert "receipt.txt" not in names
         assert "proof.json" not in names
         assert "inspector_pack/manifest.json" not in names
+        assert "receipt.txt" in names
+
+        receipt = z.read("receipt.txt").decode("utf-8")
+        assert "OORD RECEIPT v1" in receipt
+        assert "org_id: ORG-LOCAL" in receipt
+        assert "batch_id: in" in receipt
+        assert re.search(r"^merkle_root:\s+cid:sha256:", receipt, re.M)
+        assert re.search(r"^file_count:\s+2$", receipt, re.M)
+
 
     # Run: oord verify
     with pytest.raises(SystemExit) as ei_verify:
         oord_cli.main(["verify", str(bundle_path)])
     assert ei_verify.value.code == 0
     verify_out = capsys.readouterr().out
-    assert "Bundle:" in verify_out
-    assert "Hashes: OK" in verify_out
-    assert re.search(r"TL:\s+OK", verify_out)
-    assert re.search(r"JWKS:\s+OK", verify_out)
-    assert verify_out.strip().endswith("OK")
+    assert verify_out.strip().startswith("PASS ")
+    assert "org=ORG-LOCAL" in verify_out
+    assert "batch=in" in verify_out
+    assert re.search(r"root=cid:sha256:", verify_out)
+    assert re.search(r"\btl=seq:\d+", verify_out)
 
+
+def _tamper_zip_replace_member(src_zip: Path, member: str, suffix: bytes) -> None:
+    tmp = src_zip.with_suffix(".tmp.zip")
+    with zipfile.ZipFile(src_zip, "r") as zin, zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zout:
+        for info in zin.infolist():
+            data = zin.read(info.filename)
+            if info.filename == member:
+                data += suffix
+            zout.writestr(info, data)
+    tmp.replace(src_zip)
 
 def test_verify_detects_hash_mismatch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """
@@ -203,11 +221,10 @@ def test_verify_detects_hash_mismatch(tmp_path: Path, monkeypatch: pytest.Monkey
     assert bundle_candidates, "expected sealed bundle in out_dir"
     bundle_path = bundle_candidates[0]
 
-    # Tamper: open zip and change one file
+    # Tamper: copy bundle -> tmp_zip, then rewrite tmp_zip with modified member
     tmp_zip = tmp_path / "tampered.zip"
     tmp_zip.write_bytes(bundle_path.read_bytes())
-    with zipfile.ZipFile(tmp_zip, "a") as z:
-        z.writestr("files/a.txt", b"tampered")
+    _tamper_zip_replace_member(tmp_zip, "files/a.txt", b"tamper")
 
     # Verify should now fail with hash mismatch
     with pytest.raises(SystemExit) as ei_verify:
@@ -286,6 +303,7 @@ def test_build_bundle_is_deterministic(tmp_path: Path) -> None:
         assert "manifest.json" in names
         assert "jwks_snapshot.json" in names
         assert "tl_proof.json" in names
+        assert "receipt.txt" in names
         assert "files/a.txt" in names
         assert "files/sub/b.txt" in names
 

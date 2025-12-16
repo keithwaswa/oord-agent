@@ -25,14 +25,17 @@
 ├── tests
 │   ├── agent
 │   ├── cli
+│   ├── determinism
+│   ├── fixtures
 │   ├── schemas
 │   └── utils
 └── utils
 
-14 directories, 13 files
+16 directories, 13 files
 
 ## Grep (gateway/portal/merkle/signature)
 main.py:2:app = FastAPI()
+_ai/agent-context-index.md:36:## Grep (gateway/portal/merkle/signature)
 scripts/ctx.sh:33:  echo "## Grep (gateway/portal/merkle/signature)"
 scripts/ctx.sh:43:     -e '@router\.|FastAPI\(|Pydantic|Schema|type ' \
 scripts/ctx.sh:44:     -e 'Merkle|verify|sign|ed25519|sha256|reqwest|notify|Cargo\.toml' \
@@ -79,9 +82,9 @@ docs/ADR-008-oord-seal-v1.md:59:4. Fetch the verifying key corresponding to `key
 docs/ADR-008-oord-seal-v1.md:60:5. Verify the Ed25519 signature over the canonical bytes.
 docs/ADR-008-oord-seal-v1.md:61:6. Re-hash files, recompute Merkle root, and confirm it matches `merkle.root_cid`.
 docs/ADR-008-oord-seal-v1.md:65:- `hash_alg` must be `"sha256"` in v1.
-docs/ADR-008-oord-seal-v1.md:66:- `merkle.tree_alg` must be `"binary_merkle_sha256"` in v1.
 
 ## Recent Commits
+- bdbb959 Phase 2 complete
 - 137fc3a a bunch of stuff
 - 7b71de9 Make oord seal deterministic and tighten bundle layout
 - 6c2f506 CI: install pytest+pydantic directly, drop pip install .
@@ -90,4 +93,4 @@ docs/ADR-008-oord-seal-v1.md:66:- `merkle.tree_alg` must be `"binary_merkle_sha2
 - e97dd12 chore: establish seal/proof contracts and passing test baseline
 
 ## Timestamp
-Generated: 2025-12-11 22:39:38Z (UTC)
+Generated: 2025-12-13 23:26:03Z (UTC)

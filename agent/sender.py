@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import logging
 import subprocess
 import sys
 import time
@@ -12,13 +13,27 @@ from typing import Dict, List, Tuple
 
 from .config import AgentConfig
 
-def _log(msg: str) -> None:
-    """
-    Minimal human-readable logging for sender events.
-    """
-    ts = datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z"
-    print(f"[sender] {ts} {msg}")
 
+logger = logging.getLogger("agent.sender")
+
+
+def _log(level: str, event: str, **fields: object) -> None:
+    """
+    Structured-ish logging helper for sender events.
+    Emits lines like:
+      [sender] 2025-... level=INFO event=seal_start batch=B001 ...
+    """
+    ts = datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds") + "Z"
+    parts = [f"event={event}"]
+    for k, v in fields.items():
+        parts.append(f"{k}={v}")
+    msg = f"[sender] {ts} level={level.upper()} " + " ".join(parts)
+    if level.lower() == "error":
+        logger.error(msg)
+    elif level.lower() == "warning":
+        logger.warning(msg)
+    else:
+        logger.info(msg)
 
 @dataclass
 class SenderState:
@@ -119,7 +134,14 @@ def seal_batch_via_cli(
     """
     batch_id = _compute_batch_id(batch_dir, cfg.org.batch_prefix)
     
-    _log(f"sealing batch name={batch_dir.name} batch_id={batch_id} input_dir={batch_dir} out_dir={out_dir}")
+    _log(
+        "info",
+        "seal_start",
+        batch_name=batch_dir.name,
+        batch_id=batch_id,
+        input_dir=str(batch_dir),
+        out_dir=str(out_dir),
+    )
 
     cmd = [
         sys.executable,
@@ -153,7 +175,15 @@ def run_sender_loop(cfg: AgentConfig, once: bool = False) -> None:
     out_dir = cfg.sender_paths.out_dir
     state_path = cfg.sender_paths.state_file
 
-    _log(f"starting sender loop watch_dir={watch_dir} out_dir={out_dir} state_file={state_path}")
+    _log(
+        "info",
+        "agent_start",
+        watch_dir=str(watch_dir),
+        out_dir=str(out_dir),
+        state_file=str(state_path),
+        poll_interval_sec=cfg.agent.poll_interval_sec,
+        settle_seconds=cfg.agent.settle_seconds,
+    )
 
     state = load_state(state_path)
 
@@ -167,7 +197,12 @@ def run_sender_loop(cfg: AgentConfig, once: bool = False) -> None:
         )
 
         if ready_batches:
-            _log(f"found {len(ready_batches)} ready batch(es)")
+            _log(
+                "info",
+                "batches_ready",
+                count=len(ready_batches),
+                watch_dir=str(watch_dir),
+            )
 
         for batch_dir in ready_batches:
             code, stdout, stderr = seal_batch_via_cli(cfg, batch_dir, out_dir)
@@ -180,18 +215,39 @@ def run_sender_loop(cfg: AgentConfig, once: bool = False) -> None:
 
             name = batch_dir.name
             if code == 0:
-                _log(f"seal succeeded for batch name={name}")
+                _log(
+                    "info",
+                    "seal_success",
+                    batch_name=name,
+                    batch_id=_compute_batch_id(batch_dir, cfg.org.batch_prefix),
+                    out_dir=str(out_dir),
+                    exit_code=code,
+                )
                 state.processed_batches[name] = "sealed"
                 save_state(state_path, state)
             else:
                 # treat non-zero exit as env/usage error: do NOT mark processed
                 # so the batch remains eligible for retry once the environment is fixed
-                _log(f"seal failed for batch name={name} exit_code={code}; leaving state unchanged for retry")
+                _log(
+                    "error",
+                    "seal_failed",
+                    batch_name=name,
+                    batch_id=_compute_batch_id(batch_dir, cfg.org.batch_prefix),
+                    out_dir=str(out_dir),
+                    exit_code=code,
+                )
 
 
         if once:
             # Dev/one-shot mode: process whatever was ready and exit.
+            _log(
+                "info",
+                "agent_exit",
+                reason="once_mode",
+            )
             break
 
         time.sleep(cfg.agent.poll_interval_sec)
+
+    _log("info", "agent_exit", reason="loop_ended")
 

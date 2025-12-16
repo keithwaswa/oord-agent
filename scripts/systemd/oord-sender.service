@@ -1,0 +1,19 @@
+[Unit]
+Description=Oord Agent Sender
+After=network.target
+
+[Service]
+Type=simple
+User=oord
+Group=oord
+WorkingDirectory=/opt/oord-agent
+Environment="PYTHONPATH=/opt/oord-agent"
+ExecStart=/usr/bin/python -m agent sender --config /etc/oord/sender.toml
+Restart=on-failure
+RestartSec=5
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
