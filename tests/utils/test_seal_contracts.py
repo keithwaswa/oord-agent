@@ -32,8 +32,8 @@ def test_manifest_schema_file_exists_and_has_core_fields():
 
 
 def test_proof_schema_file_exists_and_has_core_fields():
-    schema_path = BASE_DIR / "schemas" / "proof_v1.json"
-    assert schema_path.is_file(), "schemas/proof_v1.json missing"
+    schema_path = BASE_DIR / "schemas" / "tl_proof_v1.json"
+    assert schema_path.is_file(), "schemas/tl_proof_v1.json missing"
 
     data = json.loads(schema_path.read_text())
     for field in ["proof_version", "tl_seq", "merkle_root", "sth_sig", "t_log_ms"]:

@@ -34,6 +34,23 @@ def test_receiver_loop_verifies_bundle(tmp_path, monkeypatch, caplog):
     # Create fake bundle.zip with files/foo.txt
     bundle = cfg.receiver_paths.incoming_dir / "oord_bundle_abc123.zip"
     with zipfile.ZipFile(bundle, "w") as z:
+        z.writestr(
+            "manifest.json",
+            json.dumps(
+                {
+                    "manifest_version": "1.0",
+                    "org_id": "ORG",
+                    "batch_id": "BATCH-1",
+                    "created_at_ms": 0,
+                    "key_id": "stub-kid",
+                    "hash_alg": "sha256",
+                    "merkle": {"root_cid": "cid:sha256:" + "a" * 64, "tree_alg": "binary_merkle_sha256"},
+                    "files": [{"path": "files/foo.txt", "sha256": "0" * 64, "size_bytes": 5}],
+                    "signature": "stub",
+                },
+                sort_keys=True,
+            ),
+        )
         z.writestr("files/foo.txt", "hello")
 
     # Stub CLI verify
@@ -44,13 +61,13 @@ def test_receiver_loop_verifies_bundle(tmp_path, monkeypatch, caplog):
     receiver.run_receiver_loop(cfg, once=True)
 
     # Confirm extraction happened
-    extracted = cfg.receiver_paths.verified_root / "oord_bundle_abc123" / "foo.txt"
+    extracted = cfg.receiver_paths.verified_root / "ORG" / "BATCH-1" / "oord_bundle_abc123" / "foo.txt"
     assert extracted.exists()
     assert extracted.read_text() == "hello"
 
     # Confirm state updated
     state = json.loads(cfg.receiver_paths.state_file.read_text())
-    assert state["processed_bundles"] == {"oord_bundle_abc123.zip": "verified"}
+    assert state["bundles"]["oord_bundle_abc123.zip"]["status"] == "verified"
 
     # Confirm logs
     msg = " ".join(r.message for r in caplog.records)

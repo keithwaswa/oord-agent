@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 import argparse
 import hashlib
-import datetime
 import json
 import os
+import logging
 import sys
 import zipfile
 from base64 import urlsafe_b64decode
@@ -20,6 +20,24 @@ except ImportError:  # pragma: no cover - verification will gracefully degrade
 from agent.config import AgentConfig, load_config as load_agent_config
 from agent.sender import run_sender_loop
 from agent.receiver import run_receiver_loop
+
+def _setup_logging(level: str, log_file: Optional[Path] = None) -> None:
+    root = logging.getLogger()
+    root.setLevel((level or "INFO").upper())
+    root.handlers.clear()
+
+    fmt = logging.Formatter("%(message)s")
+
+    sh = logging.StreamHandler(stream=sys.stdout)
+    sh.setFormatter(fmt)
+    root.addHandler(sh)
+
+    if log_file is not None:
+        log_file = log_file.expanduser()
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        fh = logging.FileHandler(log_file, encoding="utf-8")
+        fh.setFormatter(fmt)
+        root.addHandler(fh)
 
 
 # ---------------------------
@@ -218,6 +236,24 @@ def _collect_files_for_manifest(input_dir: Path) -> List[Dict[str, Any]]:
         )
     return entries
 
+def _bundle_name_for_manifest(manifest: Dict[str, Any], bundle_id: str) -> str:
+    """
+    Bundle naming contract (v1):
+      oord_bundle_<merkle_root_short>_<bundle_id>.zip
+
+    - merkle_root_short anchors the name to the payload identity (root CID)
+    - bundle_id keeps uniqueness for zip contents/versioning if needed
+    """
+    root = None
+    merkle = manifest.get("merkle")
+    if isinstance(merkle, dict) and isinstance(merkle.get("root_cid"), str):
+        root = merkle.get("root_cid")
+    # root is "cid:sha256:<64hex>"
+    root_short = "-"
+    if isinstance(root, str) and root.startswith("cid:sha256:") and len(root) >= len("cid:sha256:") + 64:
+        root_short = root[len("cid:sha256:") : len("cid:sha256:") + 16]
+    return f"oord_bundle_{root_short}_{bundle_id}.zip"
+
 
 def _compute_bundle_id(entries: List[Tuple[str, bytes]]) -> str:
     """
@@ -370,24 +406,6 @@ quarantine_dir = "~/.oord/quarantine"
 state_file = "~/.oord/state/receiver_state.json"
 """
 
-def _fetch_tl_entry(
-    base_url: str,
-    seq: int,
-    timeout_s: float = 5.0,
-) -> Dict[str, Any]:
-    """
-    Optional online TL check: GET /v1/tl/entries/{seq}
-    """
-    url = base_url.rstrip("/") + f"/v1/tl/entries/{seq}"
-    headers: Dict[str, str] = {"Accept": "application/json"}
-    req = request.Request(url, headers=headers, method="GET")
-    with request.urlopen(req, timeout=timeout_s) as resp:
-        raw = resp.read().decode("utf-8")
-    obj = json.loads(raw)
-    if not isinstance(obj, dict):
-        raise RuntimeError("TL entry response must be a JSON object")
-    return obj
-
 
 # ---------------------------
 # Bundle creation (oord seal)
@@ -448,7 +466,7 @@ def _build_bundle(
     # Bundle id is derived from the sorted entries
     bundle_id = _compute_bundle_id(files_to_write_sorted)
     out_dir.mkdir(parents=True, exist_ok=True)
-    bundle_path = out_dir / f"oord_bundle_{bundle_id}.zip"
+    bundle_path = out_dir / _bundle_name_for_manifest(manifest, bundle_id=bundle_id)
     tmp_path = bundle_path.with_suffix(".zip.tmp")
 
     with zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
@@ -1303,7 +1321,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     parser = argparse.ArgumentParser(prog="oord", description="Oord CLI (seal / verify)")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-        # oord setup
+    # oord setup
     p_setup = subparsers.add_parser("setup", help="Initialize ~/.oord scaffolding + configs + JWKS cache")
     p_setup.add_argument(
         "--core-url",
@@ -1398,6 +1416,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     def _cmd_agent(args: argparse.Namespace) -> int:
         cfg_path = Path(args.config).expanduser().resolve()
         cfg: AgentConfig = load_agent_config(cfg_path)
+        _setup_logging(cfg.logging.level, cfg.logging.file)
         if cfg.mode == "sender":
             run_sender_loop(cfg, once=getattr(args, "once", False))
         elif cfg.mode == "receiver":

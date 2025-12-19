@@ -1,4 +1,4 @@
-# ADR-008 — Oord Seal v1 Manifest & Proof Contracts
+# ADR-008 — Oord Seal v1 Manifest & TL Proof Contracts
 
 **Status:** Accepted  
 **Date:** 2025-12-02  
@@ -9,7 +9,9 @@
 This ADR defines the canonical contracts for:
 
 - `manifest.json` — **Oord Seal v1 manifest** for a sealed batch of files.
-- `proof.json` — **Oord TL proof v1** for anchoring a sealed batch into the Transparency Log (TL).
+- `tl_proof.json` — **Oord TL proof v1** for anchoring a sealed batch into the Transparency Log (TL).
+- `jwks_snapshot.json` — the verifying key material snapshot required for offline verification.
+
 
 These JSON formats are used by:
 
@@ -70,32 +72,28 @@ Verification:
 
 ## 3. TL Proof v1 — Fields & Semantics
 
-`proof.json` provides an optional Transparency Log anchoring proof for a manifest’s Merkle root.
+`tl_proof.json` provides an optional Transparency Log anchoring proof for a manifest’s Merkle root.
 
 Top-level fields:
 
-- `proof_version` — string; `"1.0"`.
 - `tl_seq` — integer; TL sequence number at which this root was committed.
 - `merkle_root` — string; `"cid:sha256:<64hex>"`, must match `manifest.merkle.root_cid`.
-- `sth` — object describing the Signed Tree Head (STH) for the TL:
-  - `tree_size` — integer; TL tree size at the time of this STH.
-  - `root_hash` — string; `"sha256:<64hex>"` Merkle root of the TL tree.
-  - `timestamp_ms` — integer; UNIX epoch milliseconds from the TL’s clock.
-  - `key_id` — string; identifier of the Ed25519 key used to sign the STH.
-  - `signature` — string; URL-safe base64 (no padding) Ed25519 signature over the STH payload.
+- `sth_sig` — string; URL-safe base64 (no padding) Ed25519 signature over the STH payload used by Core.
+- `signer_key_id` — string; key id (kid) of the TL signing key used to produce `sth_sig`.
+
 
 Semantics:
 
 - `tl_seq` is the entry sequence for this `merkle_root` in `_data/tl.db`.
 - `merkle_root` is the same value as `manifest.merkle.root_cid`.
-- `sth` can be verified using the TL JWKS; the exact STH payload format is defined in the TL ADR (ADR-007).
+- `sth_sig` can be verified using TL JWKS. The exact STH payload format is defined by Core.
 
 ## 4. JSON Schemas
 
 The following JSON Schemas are added under `oc/schemas/`:
 
 - `oc/schemas/manifest_v1.json` — “Oord Seal Manifest v1”.
-- `oc/schemas/proof_v1.json` — “Oord TL Proof v1”.
+- `oc/schemas/tl_proof_v1.json` — “Oord TL Proof v1”.
 
 These schemas:
 
@@ -117,7 +115,7 @@ Models:
 - `MerkleInfo`
 - `SealManifest`
 - `TlSth`
-- `TlProof`
+- `TlProof` (TL proof / anchoring)
 
 These models:
 
@@ -135,7 +133,7 @@ There is no attempt to auto-migrate old manifests to v1; they are treated as sep
 
 We add a basic contract test that:
 
-- Loads `manifest_v1.json` and `proof_v1.json` from `oc/schemas/`.
+- Loads `manifest_v1.json` and `tl_proof_v1.json` from `oc/schemas/`.
 - Constructs example `SealManifest` and `TlProof` instances using Pydantic.
 - Asserts that:
   - Required fields are present.

@@ -2,6 +2,8 @@
 import os
 from pathlib import Path
 import zipfile
+import json
+import time
 
 from agent import receiver, sender
 from agent.config import (
@@ -12,8 +14,8 @@ from agent.config import (
     ReceiverPaths,
     SenderPaths,
 )
-from agent.sender import SenderState
-from agent.receiver import ReceiverState
+from agent.sender import SenderState, SenderBatchStatus
+from agent.receiver import ReceiverState, ReceiverBundleStatus
 
 
 def test_find_ready_batches_respects_state_and_settle(tmp_path: Path) -> None:
@@ -37,7 +39,9 @@ def test_find_ready_batches_respects_state_and_settle(tmp_path: Path) -> None:
     os.utime(f1, (older, older))
     os.utime(f2, (newer, newer))
 
-    state = SenderState(processed_batches={"job1": "sealed"})
+    state = SenderState(
+        batches={"job1": SenderBatchStatus(status="sealed")}
+    )
 
     now = older + 10.0  # 10 seconds after older
     settle_seconds = 5
@@ -53,6 +57,20 @@ def test_find_ready_batches_respects_state_and_settle(tmp_path: Path) -> None:
     names = {p.name for p in ready}
     assert "job1" not in names
 
+def test_sender_backoff_skips_until_next_retry(tmp_path: Path) -> None:
+    watch_dir = tmp_path / "watch"
+    watch_dir.mkdir()
+
+    job = watch_dir / "job1"
+    job.mkdir()
+    (job / "a.txt").write_text("x", encoding="utf-8")
+
+    st = SenderState(
+        batches={"job1": SenderBatchStatus(status="retry", attempts=1, next_retry_at_ms=2_000_000)}
+    )
+
+    ready = sender.find_ready_batches(watch_dir=watch_dir, state=st, settle_seconds=0, now=1.0)
+    assert ready == []
 
 
 def test_find_ready_bundles_respects_state_and_pattern(tmp_path: Path) -> None:
@@ -71,7 +89,9 @@ def test_find_ready_bundles_respects_state_and_pattern(tmp_path: Path) -> None:
     os.utime(good, (older, older))
     os.utime(done, (older, older))
 
-    state = ReceiverState(processed_bundles={"oord_bundle_done.zip": "verified"})
+    state = ReceiverState(
+        bundles={"oord_bundle_done.zip": ReceiverBundleStatus(status="verified")}
+    )
 
     now = older + 10.0
     settle_seconds = 5
@@ -91,18 +111,22 @@ def test_find_ready_bundles_respects_state_and_pattern(tmp_path: Path) -> None:
 
 def test_sender_state_roundtrip(tmp_path: Path) -> None:
     state_path = tmp_path / "sender_state.json"
-    original = SenderState(processed_batches={"job1": "sealed", "job2": "failed"})
+    original = SenderState(
+        batches={"job1": SenderBatchStatus(status="sealed"), "job2": SenderBatchStatus(status="retry", attempts=2)}
+    )
     sender.save_state(state_path, original)
     loaded = sender.load_state(state_path)
-    assert loaded.processed_batches == original.processed_batches
+    assert loaded.batches.keys() == original.batches.keys()
+    assert loaded.batches["job1"].status == "sealed"
 
 
 def test_receiver_state_roundtrip(tmp_path: Path) -> None:
     state_path = tmp_path / "receiver_state.json"
-    original = ReceiverState(processed_bundles={"bundle1.zip": "verified"})
+    original = ReceiverState(bundles={"bundle1.zip": ReceiverBundleStatus(status="verified")})
     receiver.save_state(state_path, original)
     loaded = receiver.load_state(state_path)
-    assert loaded.processed_bundles == original.processed_bundles
+    assert loaded.bundles.keys() == original.bundles.keys()
+    assert loaded.bundles["bundle1.zip"].status == "verified"
 
 def test_sender_once_seals_ready_batch_and_updates_state(tmp_path: Path, monkeypatch) -> None:
     watch_dir = tmp_path / "watch"
@@ -142,10 +166,10 @@ def test_sender_once_seals_ready_batch_and_updates_state(tmp_path: Path, monkeyp
     # batch should have been processed exactly once and state updated
     assert calls == [batch]
     loaded = sender.load_state(state_file)
-    assert loaded.processed_batches == {"job1": "sealed"}
+    assert loaded.batches["job1"].status == "sealed"
 
 
-def test_sender_once_does_not_mark_state_on_cli_error(tmp_path: Path, monkeypatch) -> None:
+def test_sender_once_records_retry_state_on_cli_env_error(tmp_path: Path, monkeypatch) -> None:
     watch_dir = tmp_path / "watch"
     out_dir = tmp_path / "out"
     state_file = tmp_path / "sender_state.json"
@@ -179,13 +203,39 @@ def test_sender_once_does_not_mark_state_on_cli_error(tmp_path: Path, monkeypatc
     sender.run_sender_loop(cfg, once=True)
 
     loaded = sender.load_state(state_file)
-    # No batches should be marked processed
-    assert loaded.processed_batches == {}
+    # Env/usage error should NOT mark sealed, but should persist retry metadata
+    assert "job1" in loaded.batches
+    st = loaded.batches["job1"]
+    assert st.status == "retry"
+    assert st.attempts == 1
+    assert st.last_exit_code == 2
+    assert st.last_error == "env-error"
+    # next_retry_at_ms is time-based; just assert it exists and is an int
+    assert isinstance(st.next_retry_at_ms, int)
+    assert st.next_retry_at_ms > 0
+
 
 
 def _make_test_bundle_with_file(bundle_path: Path) -> None:
     bundle_path.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(bundle_path, "w") as z:
+        z.writestr(
+            "manifest.json",
+            json.dumps(
+                {
+                    "manifest_version": "1.0",
+                    "org_id": "DEMO-ORG",
+                    "batch_id": "BATCH-1",
+                    "created_at_ms": 0,
+                    "key_id": "stub-kid",
+                    "hash_alg": "sha256",
+                    "merkle": {"root_cid": "cid:sha256:" + "a" * 64, "tree_alg": "binary_merkle_sha256"},
+                    "files": [{"path": "files/a.txt", "sha256": "0" * 64, "size_bytes": 5}],
+                    "signature": "stub",
+                },
+                sort_keys=True,
+            ),
+        )
         z.writestr("files/a.txt", "hello")
 
 
@@ -220,9 +270,9 @@ def test_receiver_once_verifies_and_extracts(tmp_path: Path, monkeypatch) -> Non
     receiver.run_receiver_loop(cfg, once=True)
 
     loaded = receiver.load_state(state_file)
-    assert loaded.processed_bundles == {"oord_bundle_demo.zip": "verified"}
+    assert loaded.bundles["oord_bundle_demo.zip"].status == "verified"
 
-    extracted = verified_root / "oord_bundle_demo" / "a.txt"
+    extracted = verified_root / "DEMO-ORG" / "BATCH-1" / "oord_bundle_demo" / "a.txt"
     assert extracted.is_file()
     assert extracted.read_text(encoding="utf-8") == "hello"
 
@@ -259,7 +309,7 @@ def test_receiver_once_quarantines_on_verify_failure(tmp_path: Path, monkeypatch
     receiver.run_receiver_loop(cfg, once=True)
 
     loaded = receiver.load_state(state_file)
-    assert loaded.processed_bundles == {"oord_bundle_demo.zip": "quarantined"}
+    assert loaded.bundles["oord_bundle_demo.zip"].status == "quarantined"
     # bundle should have been moved out of incoming and into quarantine
     assert not bundle.exists()
     assert (quarantine_dir / "oord_bundle_demo.zip").is_file()
@@ -297,8 +347,23 @@ def test_receiver_once_on_env_error_keeps_bundle_unprocessed(tmp_path: Path, mon
     receiver.run_receiver_loop(cfg, once=True)
 
     loaded = receiver.load_state(state_file)
-    assert loaded.processed_bundles == {}
+    assert loaded.bundles["oord_bundle_demo.zip"].status == "retry"
     # bundle should still be in incoming, not moved or extracted
     assert bundle.is_file()
     assert not verified_root.exists()
     assert not quarantine_dir.exists()
+
+
+def test_receiver_extract_is_staged(tmp_path: Path) -> None:
+    incoming = tmp_path / "incoming"
+    verified = tmp_path / "verified"
+    incoming.mkdir()
+    verified.mkdir()
+
+    bundle = incoming / "oord_bundle_demo.zip"
+    _make_test_bundle_with_file(bundle)
+
+    dest = receiver._extract_verified_files(bundle, verified)
+    assert dest.exists()
+    assert not dest.with_name(dest.name + ".tmp").exists()
+

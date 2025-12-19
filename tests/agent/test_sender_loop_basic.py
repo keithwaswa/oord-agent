@@ -50,7 +50,7 @@ def test_sender_loop_seals_one_batch(tmp_path, monkeypatch, caplog):
 
     # Assert state file updated
     state_data = json.loads(cfg.sender_paths.state_file.read_text())
-    assert state_data["processed_batches"] == {"run001": "sealed"}
+    assert state_data["batches"]["run001"]["status"] == "sealed"
 
     # Assert logs emitted expected events
     msg = " ".join(r.message for r in caplog.records)

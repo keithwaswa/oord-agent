@@ -27,7 +27,7 @@ class TlProof(BaseModel):
     """
     Canonical TL proof shape shared with:
       - /v1/seal TL info (Core)
-      - schemas/proof_v1.json
+      - schemas/tl_proof_v1.json
       - tl_proof.json in bundles
     """
     proof_version: str = "1.0"

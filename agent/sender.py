@@ -9,7 +9,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 from .config import AgentConfig
 
@@ -36,31 +36,67 @@ def _log(level: str, event: str, **fields: object) -> None:
         logger.info(msg)
 
 @dataclass
+class SenderBatchStatus:
+    status: str  # "sealed" | "retry"
+    attempts: int = 0
+    next_retry_at_ms: int = 0
+    last_exit_code: Optional[int] = None
+    last_error: Optional[str] = None
+
+@dataclass
 class SenderState:
-    processed_batches: Dict[str, str]
+    batches: Dict[str, SenderBatchStatus]
 
 
 def load_state(path: Path) -> SenderState:
     if not path.is_file():
-        return SenderState(processed_batches={})
+        return SenderState(batches={})
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
-        return SenderState(processed_batches={})
-    processed = data.get("processed_batches") or {}
-    if not isinstance(processed, dict):
-        processed = {}
-    # normalize keys to str
-    processed_str: Dict[str, str] = {}
-    for k, v in processed.items():
-        if isinstance(k, str) and isinstance(v, str):
-            processed_str[k] = v
-    return SenderState(processed_batches=processed_str)
+        return SenderState(batches={})
+
+    raw = data.get("batches") or {}
+    if not isinstance(raw, dict):
+        return SenderState(batches={})
+
+    out: Dict[str, SenderBatchStatus] = {}
+    for name, v in raw.items():
+        if not isinstance(name, str) or not isinstance(v, dict):
+            continue
+        status = v.get("status")
+        if status not in ("sealed", "retry"):
+            continue
+        attempts = v.get("attempts")
+        next_retry_at_ms = v.get("next_retry_at_ms")
+        last_exit_code = v.get("last_exit_code")
+        last_error = v.get("last_error")
+
+        out[name] = SenderBatchStatus(
+            status=status,
+            attempts=int(attempts) if isinstance(attempts, int) and attempts >= 0 else 0,
+            next_retry_at_ms=int(next_retry_at_ms) if isinstance(next_retry_at_ms, int) and next_retry_at_ms >= 0 else 0,
+            last_exit_code=int(last_exit_code) if isinstance(last_exit_code, int) else None,
+            last_error=str(last_error) if isinstance(last_error, str) else None,
+        )
+
+    return SenderState(batches=out)
 
 
 def save_state(path: Path, state: SenderState) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    data = {"processed_batches": state.processed_batches}
+    data = {
+        "batches": {
+            name: {
+                "status": s.status,
+                "attempts": s.attempts,
+                "next_retry_at_ms": s.next_retry_at_ms,
+                "last_exit_code": s.last_exit_code,
+                "last_error": s.last_error,
+            }
+            for name, s in state.batches.items()
+        }
+    }
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(data, sort_keys=True, indent=2), encoding="utf-8")
     tmp.replace(path)
@@ -84,6 +120,13 @@ def is_folder_stable(folder: Path, settle_seconds: int, now: float | None = None
     latest = _latest_mtime(folder)
     return (now - latest) >= settle_seconds
 
+def _compute_backoff_ms(attempts: int) -> int:
+    base = 500
+    cap = 60_000
+    exp = min(cap, base * (2 ** max(0, attempts - 1)))
+    jitter = int((time.time() * 1000) % 250)
+    return min(cap, exp + jitter)
+
 
 def find_ready_batches(
     watch_dir: Path,
@@ -99,15 +142,19 @@ def find_ready_batches(
       - have not changed in the last settle_seconds
     """
     ready: List[Path] = []
-    processed = state.processed_batches
     if not watch_dir.is_dir():
         return ready
+    
+    now_ms = int((now if now is not None else time.time()) * 1000)
 
     for child in sorted(watch_dir.iterdir()):
         if not child.is_dir():
             continue
         name = child.name
-        if processed.get(name) == "sealed":
+        st = state.batches.get(name)
+        if st and st.status == "sealed":
+            continue
+        if st and st.next_retry_at_ms and now_ms < st.next_retry_at_ms:
             continue
         if not is_folder_stable(child, settle_seconds=settle_seconds, now=now):
             continue
@@ -223,11 +270,26 @@ def run_sender_loop(cfg: AgentConfig, once: bool = False) -> None:
                     out_dir=str(out_dir),
                     exit_code=code,
                 )
-                state.processed_batches[name] = "sealed"
+                prev = state.batches.get(name)
+                state.batches[name] = SenderBatchStatus(
+                    status="sealed",
+                    attempts=prev.attempts if prev else 0,
+                    next_retry_at_ms=0,
+                    last_exit_code=0,
+                    last_error=None,
+                )
                 save_state(state_path, state)
             else:
-                # treat non-zero exit as env/usage error: do NOT mark processed
-                # so the batch remains eligible for retry once the environment is fixed
+                entry = state.batches.get(name) or SenderBatchStatus(status="retry")
+                entry.status = "retry"
+                entry.attempts = entry.attempts + 1
+                entry.last_exit_code = int(code)
+                entry.last_error = (stderr.strip() if stderr else None) or (stdout.strip() if stdout else None)
+                backoff_ms = _compute_backoff_ms(entry.attempts)
+                entry.next_retry_at_ms = int(time.time() * 1000) + backoff_ms
+                state.batches[name] = entry
+                save_state(state_path, state)
+
                 _log(
                     "error",
                     "seal_failed",
@@ -235,6 +297,7 @@ def run_sender_loop(cfg: AgentConfig, once: bool = False) -> None:
                     batch_id=_compute_batch_id(batch_dir, cfg.org.batch_prefix),
                     out_dir=str(out_dir),
                     exit_code=code,
+                    next_retry_in_ms=backoff_ms,
                 )
 
 
